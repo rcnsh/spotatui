@@ -47,6 +47,17 @@ struct MacosMetadata {
   art_url: Option<String>,
 }
 
+/// The shuffle and repeat modes last published to Now Playing.
+///
+/// Tracked apart from [`MacosMetadata`] because they change independently of the
+/// track: folding them into that struct would refetch artwork on every toggle.
+#[cfg(all(feature = "macos-media", target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MacosModes {
+  shuffle: bool,
+  repeat: macos_media::MacRepeatMode,
+}
+
 #[cfg(all(feature = "windows-media", target_os = "windows"))]
 #[derive(Default, PartialEq)]
 struct WindowsMetadata {
@@ -70,8 +81,24 @@ fn resolve_discord_app_id(user_config: &UserConfig) -> Option<String> {
 fn update_macos_metadata(
   manager: &macos_media::MacMediaManager,
   last_metadata: &mut Option<MacosMetadata>,
+  last_modes: &mut Option<MacosModes>,
   app: &App,
 ) {
+  // Push shuffle/repeat only on a change: each send crosses to the media thread
+  // and rewrites a command-centre property, and this runs once a second.
+  fn publish_modes(
+    manager: &macos_media::MacMediaManager,
+    last_modes: &mut Option<MacosModes>,
+    modes: MacosModes,
+  ) {
+    if *last_modes == Some(modes) {
+      return;
+    }
+    manager.set_shuffle(modes.shuffle);
+    manager.set_repeat(modes.repeat);
+    *last_modes = Some(modes);
+  }
+
   // Local-file playback owns its own state and never populates the Spotify
   // playback context, so Now Playing must read metadata, play state, and
   // position straight from the live local player when local is active. Skipped
@@ -124,6 +151,16 @@ fn update_macos_metadata(
 
     manager.set_playback_status(is_playing);
     manager.set_position(position_ms);
+    // Local playback carries the decoded shuffle/repeat modes, like the MPRIS
+    // twin in `core/driver/presence.rs`.
+    publish_modes(
+      manager,
+      last_modes,
+      MacosModes {
+        shuffle: app.decoded_shuffle,
+        repeat: decoded_repeat_to_mac(app.decoded_repeat),
+      },
+    );
     return;
   }
 
@@ -147,8 +184,47 @@ fn update_macos_metadata(
       );
       *last_metadata = Some(new_metadata);
     }
-  } else if last_metadata.is_some() {
-    *last_metadata = None;
+
+    // A `None` repeat means the source has no repeat control of its own (the
+    // native queue, radio); reporting "off" is the honest reading, and it stops
+    // a controller from drawing the suspended context's stale mode.
+    publish_modes(
+      manager,
+      last_modes,
+      MacosModes {
+        shuffle: snapshot.shuffle,
+        repeat: match snapshot.repeat {
+          Some(rspotify::model::enums::RepeatState::Track) => macos_media::MacRepeatMode::One,
+          Some(rspotify::model::enums::RepeatState::Context) => macos_media::MacRepeatMode::All,
+          Some(rspotify::model::enums::RepeatState::Off) | None => macos_media::MacRepeatMode::Off,
+        },
+      },
+    );
+  } else {
+    if last_metadata.is_some() {
+      *last_metadata = None;
+    }
+    // Nothing is playing: clear the toggles so they do not linger on whatever
+    // the last track happened to be using.
+    publish_modes(
+      manager,
+      last_modes,
+      MacosModes {
+        shuffle: false,
+        repeat: macos_media::MacRepeatMode::Off,
+      },
+    );
+  }
+}
+
+/// Map the player-global decoded repeat mode onto the Now Playing vocabulary.
+#[cfg(all(feature = "macos-media", target_os = "macos", feature = "audio-decode"))]
+fn decoded_repeat_to_mac(mode: crate::infra::queue::RepeatMode) -> macos_media::MacRepeatMode {
+  use crate::infra::queue::RepeatMode;
+  match mode {
+    RepeatMode::Off => macos_media::MacRepeatMode::Off,
+    RepeatMode::Track => macos_media::MacRepeatMode::One,
+    RepeatMode::Context => macos_media::MacRepeatMode::All,
   }
 }
 
@@ -304,6 +380,11 @@ pub(super) async fn launch_ui(boot: Boot) -> Result<()> {
   let shared_position_for_mpris = Arc::clone(&shared_position);
   #[cfg(all(feature = "macos-media", target_os = "macos"))]
   let shared_is_playing_for_macos = Arc::clone(&shared_is_playing);
+  // `macos-media` pulls in `streaming`, so `shared_position` is always in scope
+  // here. Seeking from Now Playing writes through it the same way MPRIS does, so
+  // a later relative seek resolves against the position the user just scrubbed to.
+  #[cfg(all(feature = "macos-media", target_os = "macos"))]
+  let shared_position_for_macos = Arc::clone(&shared_position);
   #[cfg(feature = "streaming")]
   let (streaming_recovery_tx, streaming_recovery_rx) =
     tokio::sync::mpsc::unbounded_channel::<player::StreamingRecoveryRequest>();
@@ -423,8 +504,16 @@ pub(super) async fn launch_ui(boot: Boot) -> Result<()> {
   if let Some(ref macos_media) = macos_media_manager {
     if let Some(event_rx) = macos_media.take_event_rx() {
       let app_for_macos = Arc::clone(&app);
+      let macos_media_for_events = Arc::clone(macos_media);
       tokio::spawn(async move {
-        handle_macos_media_events(event_rx, app_for_macos, shared_is_playing_for_macos).await;
+        handle_macos_media_events(
+          event_rx,
+          app_for_macos,
+          shared_is_playing_for_macos,
+          shared_position_for_macos,
+          macos_media_for_events,
+        )
+        .await;
       });
     }
   }
@@ -437,12 +526,18 @@ pub(super) async fn launch_ui(boot: Boot) -> Result<()> {
     let app_for_macos_metadata = Arc::clone(&app);
     tokio::spawn(async move {
       let mut last_metadata: Option<MacosMetadata> = None;
+      let mut last_modes: Option<MacosModes> = None;
       let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
 
       loop {
         interval.tick().await;
         if let Ok(app) = app_for_macos_metadata.try_lock() {
-          update_macos_metadata(&macos_media_for_metadata, &mut last_metadata, &app);
+          update_macos_metadata(
+            &macos_media_for_metadata,
+            &mut last_metadata,
+            &mut last_modes,
+            &app,
+          );
         }
       }
     });
@@ -1215,6 +1310,8 @@ async fn handle_macos_media_events(
   mut event_rx: tokio::sync::mpsc::UnboundedReceiver<macos_media::MacMediaEvent>,
   app: Arc<Mutex<App>>,
   shared_is_playing: Arc<std::sync::atomic::AtomicBool>,
+  shared_position: Arc<AtomicU64>,
+  manager: Arc<macos_media::MacMediaManager>,
 ) {
   use macos_media::MacMediaEvent;
   use std::sync::atomic::Ordering;
@@ -1266,6 +1363,54 @@ async fn handle_macos_media_events(
         player.pause();
         app.lock().await.set_native_playback_intent(false);
       }
+      // Now Playing scrubbing reports an absolute target, so unlike the MPRIS
+      // `Seek` twin there is no current position to add it to.
+      MacMediaEvent::Seek(position_ms) => {
+        player.seek(position_ms);
+        shared_position.store(u64::from(position_ms), Ordering::Relaxed);
+        // `try_lock`, as the MPRIS twin does: the position is already committed
+        // to the player and the atomic, and blocking the media-event task behind
+        // a frame's lock only delays the next command for a cache update the
+        // next tick would redo anyway.
+        if let Ok(mut app_lock) = app.try_lock() {
+          app_lock.song_progress_ms = u128::from(position_ms);
+          app_lock.set_native_recovery_position(position_ms);
+        }
+      }
+      MacMediaEvent::SetShuffle(enabled) => {
+        if let Err(e) = player.set_shuffle(enabled) {
+          log::warn!("macos media: failed to set shuffle: {e}");
+        } else {
+          let mut app_lock = app.lock().await;
+          app_lock.set_native_recovery_shuffle(enabled);
+          app_lock.set_context_shuffle_state(enabled);
+          app_lock.runtime_state.shuffle_enabled = enabled;
+          app_lock.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
+            enabled,
+          ));
+          drop(app_lock);
+          manager.set_shuffle(enabled);
+        }
+      }
+      MacMediaEvent::SetRepeat(mode) => {
+        use macos_media::MacRepeatMode;
+        use rspotify::model::enums::RepeatState;
+
+        let repeat_state = match mode {
+          MacRepeatMode::Off => RepeatState::Off,
+          MacRepeatMode::One => RepeatState::Track,
+          MacRepeatMode::All => RepeatState::Context,
+        };
+        if let Err(e) = player.set_repeat_mode(repeat_state) {
+          log::warn!("macos media: failed to set repeat mode: {e}");
+        } else {
+          let mut app_lock = app.lock().await;
+          app_lock.set_native_recovery_repeat(repeat_state);
+          app_lock.set_context_repeat_state(repeat_state);
+          drop(app_lock);
+          manager.set_repeat(mode);
+        }
+      }
     }
   }
 }
@@ -1315,6 +1460,30 @@ async fn route_decoded_macos_event(
     }
     MacMediaEvent::Previous => {
       app_lock.dispatch(IoEvent::PreviousTrack);
+    }
+    MacMediaEvent::Seek(position_ms) => {
+      app_lock.dispatch(IoEvent::Seek(*position_ms));
+    }
+    // Shuffle and repeat drive the player-global decoded state, so an external
+    // controller changes the audible decoded source rather than the stale
+    // Spotify context. A source that cannot honour them (radio is an endless
+    // stream; the queue slot plays an explicit list over a suspended context)
+    // rejects the change — but the event is still consumed, exactly as the MPRIS
+    // twin does, so it never falls through and flips shuffle on the user's real
+    // Spotify device for a source they are not listening to.
+    MacMediaEvent::SetShuffle(enabled) => {
+      app_lock.set_decoded_shuffle(*enabled);
+    }
+    MacMediaEvent::SetRepeat(mode) => {
+      use crate::infra::queue::RepeatMode;
+      use macos_media::MacRepeatMode;
+
+      let repeat = match mode {
+        MacRepeatMode::Off => RepeatMode::Off,
+        MacRepeatMode::One => RepeatMode::Track,
+        MacRepeatMode::All => RepeatMode::Context,
+      };
+      app_lock.set_decoded_repeat(repeat);
     }
   }
   true

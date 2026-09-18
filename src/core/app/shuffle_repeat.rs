@@ -120,13 +120,19 @@ impl App {
   }
 
   /// Set the decoded shuffle to an explicit value from an external media
-  /// controller (MPRIS), reordering the active source's queue. Returns whether a
-  /// queueable decoded source consumed it. A `false` return does **not** mean
-  /// "hand this to Spotify": the caller rejects the request and corrects the
-  /// client's property instead, because reaching this method at all means a
-  /// decoded source (radio, or the queue slot) owns playback and the Spotify
-  /// context is not what the user is listening to.
-  #[cfg(all(feature = "mpris", target_os = "linux", feature = "audio-decode",))]
+  /// controller (MPRIS, or macOS Now Playing), reordering the active source's
+  /// queue. Returns whether a queueable decoded source consumed it. A `false`
+  /// return does **not** mean "hand this to Spotify": the caller rejects the
+  /// request and corrects the client's property instead, because reaching this
+  /// method at all means a decoded source (radio, or the queue slot) owns
+  /// playback and the Spotify context is not what the user is listening to.
+  #[cfg(all(
+    feature = "audio-decode",
+    any(
+      all(feature = "mpris", target_os = "linux"),
+      all(feature = "macos-media", target_os = "macos")
+    )
+  ))]
   pub fn set_decoded_shuffle(&mut self, on: bool) -> bool {
     if !self.active_queueable_decoded_source() {
       return false;
@@ -139,9 +145,16 @@ impl App {
   }
 
   /// Set the decoded repeat mode to an explicit value from an external media
-  /// controller (MPRIS). Returns whether a queueable decoded source consumed it
-  /// (see [`set_decoded_shuffle`](Self::set_decoded_shuffle)).
-  #[cfg(all(feature = "mpris", target_os = "linux", feature = "audio-decode"))]
+  /// controller (MPRIS, or macOS Now Playing). Returns whether a queueable
+  /// decoded source consumed it (see
+  /// [`set_decoded_shuffle`](Self::set_decoded_shuffle)).
+  #[cfg(all(
+    feature = "audio-decode",
+    any(
+      all(feature = "mpris", target_os = "linux"),
+      all(feature = "macos-media", target_os = "macos")
+    )
+  ))]
   pub fn set_decoded_repeat(&mut self, mode: RepeatMode) -> bool {
     if !self.active_queueable_decoded_source() {
       return false;

@@ -126,6 +126,38 @@ impl App {
 
   /// `Some(true)` when a decoded source owns the sink and plays, `Some(false)`
   /// when it owns the sink and is paused, `None` when none owns it.
+  /// Record a shuffle change an external media controller (MPRIS, macOS Now
+  /// Playing) just made, so the UI reflects it before the next playback poll
+  /// returns it. A no-op with no Spotify context, which is the right answer: a
+  /// controller can only reach this while librespot owns playback.
+  ///
+  /// Lives here rather than beside the other shuffle code because this module is
+  /// one of the two the `direct_playback_context_reads` gate exempts — the
+  /// sanctioned home for raw `current_playback_context` access, so callers get
+  /// an intent-named method instead of reaching through the field themselves.
+  #[cfg_attr(
+    not(all(feature = "macos-media", target_os = "macos")),
+    allow(dead_code)
+  )]
+  pub(crate) fn set_context_shuffle_state(&mut self, on: bool) {
+    if let Some(context) = self.current_playback_context.as_mut() {
+      context.shuffle_state = on;
+    }
+  }
+
+  /// Repeat twin of [`set_context_shuffle_state`](Self::set_context_shuffle_state).
+  #[cfg_attr(
+    not(all(feature = "macos-media", target_os = "macos")),
+    allow(dead_code)
+  )]
+  // Spelled out rather than imported: `core/app/mod.rs` only pulls `RepeatState`
+  // in under `streaming`, and this method exists in every build.
+  pub(crate) fn set_context_repeat_state(&mut self, state: rspotify::model::enums::RepeatState) {
+    if let Some(context) = self.current_playback_context.as_mut() {
+      context.repeat_state = state;
+    }
+  }
+
   pub(crate) fn decoded_playing_state(&self) -> Option<bool> {
     #[cfg(feature = "audio-decode")]
     {

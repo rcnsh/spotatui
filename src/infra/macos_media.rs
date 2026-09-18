@@ -16,17 +16,32 @@ use objc2::AnyThread;
 use objc2_app_kit::NSImage;
 use objc2_foundation::{NSData, NSDate, NSMutableDictionary, NSNumber, NSRunLoop, NSString};
 use objc2_media_player::{
-  MPMediaItemArtwork, MPMediaItemPropertyAlbumTitle, MPMediaItemPropertyArtist,
-  MPMediaItemPropertyArtwork, MPMediaItemPropertyPlaybackDuration, MPMediaItemPropertyTitle,
-  MPNowPlayingInfoCenter, MPNowPlayingInfoPropertyElapsedPlaybackTime,
+  MPChangePlaybackPositionCommandEvent, MPChangeRepeatModeCommandEvent,
+  MPChangeShuffleModeCommandEvent, MPMediaItemArtwork, MPMediaItemPropertyAlbumTitle,
+  MPMediaItemPropertyArtist, MPMediaItemPropertyArtwork, MPMediaItemPropertyPlaybackDuration,
+  MPMediaItemPropertyTitle, MPNowPlayingInfoCenter, MPNowPlayingInfoPropertyElapsedPlaybackTime,
   MPNowPlayingInfoPropertyPlaybackRate, MPNowPlayingPlaybackState, MPRemoteCommandCenter,
-  MPRemoteCommandEvent, MPRemoteCommandHandlerStatus,
+  MPRemoteCommandEvent, MPRemoteCommandHandlerStatus, MPRepeatType, MPShuffleType,
 };
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// How an external controller asked us to repeat.
+///
+/// Mirrors `MPRepeatType` rather than re-using rspotify's `RepeatState`, so this
+/// module stays free of the Spotify types: the mapping onto whichever player
+/// owns playback belongs to the caller, exactly as it does for MPRIS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacRepeatMode {
+  Off,
+  /// Repeat the current track.
+  One,
+  /// Repeat the whole context.
+  All,
+}
 
 /// Events that can be received from external macOS media controls (media keys, Control Center, etc.)
 #[derive(Debug, Clone)]
@@ -37,6 +52,14 @@ pub enum MacMediaEvent {
   Next,
   Previous,
   Stop,
+  /// Absolute seek target in milliseconds, from a Now Playing scrubber.
+  ///
+  /// `MPChangePlaybackPositionCommandEvent` reports an absolute time, unlike
+  /// MPRIS `Seek`, which is a relative offset — so this needs no current
+  /// position to resolve against.
+  Seek(u32),
+  SetShuffle(bool),
+  SetRepeat(MacRepeatMode),
 }
 
 /// Commands to send TO the Now Playing center to update its state
@@ -54,6 +77,14 @@ pub enum MacMediaCommand {
   SetPosition(u64),        // position in milliseconds
   SetVolume(u8),           // 0-100 (not directly supported by Now Playing, but kept for API parity)
   SetStopped,
+  /// Publish the shuffle state back to the shuffle command.
+  ///
+  /// Now Playing reads shuffle and repeat off the *command* objects rather than
+  /// the info dictionary, so a client only ever sees these once they are pushed
+  /// here — without it a notch or Control Center draws both toggles as off no
+  /// matter what the player is doing.
+  SetShuffle(bool),
+  SetRepeat(MacRepeatMode),
 }
 
 /// Manager for the macOS Now Playing integration
@@ -180,6 +211,86 @@ impl MacMediaManager {
           .addTargetWithHandler(&stop_handler);
       }
 
+      // Scrubbing a Now Playing progress bar arrives here as an absolute
+      // position, in seconds. Without this target the command stays disabled and
+      // every client — Control Center, a notch, the Touch Bar — refuses the
+      // drag rather than sending it.
+      let tx = Arc::clone(&event_tx);
+      let position_handler: RcBlock<
+        dyn Fn(NonNull<MPRemoteCommandEvent>) -> MPRemoteCommandHandlerStatus,
+      > = RcBlock::new(move |event: NonNull<MPRemoteCommandEvent>| {
+        // The command centre hands each command its own event subclass; this
+        // target is only ever attached to `changePlaybackPositionCommand`.
+        let position_s = unsafe {
+          event
+            .cast::<MPChangePlaybackPositionCommandEvent>()
+            .as_ref()
+            .positionTime()
+        };
+        if !position_s.is_finite() || position_s < 0.0 {
+          return MPRemoteCommandHandlerStatus::CommandFailed;
+        }
+        let position_ms = (position_s * 1000.0) as u32;
+        info!("macos media: received Seek event ({position_ms} ms)");
+        let _ = tx.send(MacMediaEvent::Seek(position_ms));
+        MPRemoteCommandHandlerStatus::Success
+      });
+      unsafe {
+        let command = command_center.changePlaybackPositionCommand();
+        command.setEnabled(true);
+        command.addTargetWithHandler(&position_handler);
+      }
+
+      let tx = Arc::clone(&event_tx);
+      let shuffle_handler: RcBlock<
+        dyn Fn(NonNull<MPRemoteCommandEvent>) -> MPRemoteCommandHandlerStatus,
+      > = RcBlock::new(move |event: NonNull<MPRemoteCommandEvent>| {
+        let shuffle_type = unsafe {
+          event
+            .cast::<MPChangeShuffleModeCommandEvent>()
+            .as_ref()
+            .shuffleType()
+        };
+        // `Collections` shuffles groups rather than tracks; spotatui has one
+        // shuffle, so anything that is not `Off` turns it on.
+        let enabled = shuffle_type != MPShuffleType::Off;
+        info!("macos media: received SetShuffle event ({enabled})");
+        let _ = tx.send(MacMediaEvent::SetShuffle(enabled));
+        MPRemoteCommandHandlerStatus::Success
+      });
+      unsafe {
+        let command = command_center.changeShuffleModeCommand();
+        command.setEnabled(true);
+        command.addTargetWithHandler(&shuffle_handler);
+      }
+
+      let tx = Arc::clone(&event_tx);
+      let repeat_handler: RcBlock<
+        dyn Fn(NonNull<MPRemoteCommandEvent>) -> MPRemoteCommandHandlerStatus,
+      > = RcBlock::new(move |event: NonNull<MPRemoteCommandEvent>| {
+        let repeat_type = unsafe {
+          event
+            .cast::<MPChangeRepeatModeCommandEvent>()
+            .as_ref()
+            .repeatType()
+        };
+        let mode = match repeat_type {
+          MPRepeatType::One => MacRepeatMode::One,
+          MPRepeatType::All => MacRepeatMode::All,
+          // `Off`, and any value a future macOS adds: repeating nothing is the
+          // safe reading of a mode we do not recognise.
+          _ => MacRepeatMode::Off,
+        };
+        info!("macos media: received SetRepeat event ({mode:?})");
+        let _ = tx.send(MacMediaEvent::SetRepeat(mode));
+        MPRemoteCommandHandlerStatus::Success
+      });
+      unsafe {
+        let command = command_center.changeRepeatModeCommand();
+        command.setEnabled(true);
+        command.addTargetWithHandler(&repeat_handler);
+      }
+
       info!("macos media: remote command handlers registered");
 
       // Get the now playing info center
@@ -197,7 +308,7 @@ impl MacMediaManager {
         loop {
           tokio::select! {
             Some(cmd) = command_rx.recv() => {
-              handle_now_playing_command(&cmd, &info_center).await;
+              handle_now_playing_command(&cmd, &info_center, &command_center).await;
             }
             _ = interval.tick() => {
               NSRunLoop::currentRunLoop()
@@ -265,11 +376,26 @@ impl MacMediaManager {
   pub fn set_stopped(&self) {
     let _ = self.command_tx.send(MacMediaCommand::SetStopped);
   }
+
+  /// Publish the current shuffle state so external controllers draw it correctly.
+  pub fn set_shuffle(&self, enabled: bool) {
+    let _ = self.command_tx.send(MacMediaCommand::SetShuffle(enabled));
+  }
+
+  /// Publish the current repeat mode so external controllers draw it correctly.
+  pub fn set_repeat(&self, mode: MacRepeatMode) {
+    let _ = self.command_tx.send(MacMediaCommand::SetRepeat(mode));
+  }
 }
 
 /// Process a single Now Playing command, updating the info center state.
-/// Must be called from the dedicated macOS media thread that owns `info_center`.
-async fn handle_now_playing_command(cmd: &MacMediaCommand, info_center: &MPNowPlayingInfoCenter) {
+/// Must be called from the dedicated macOS media thread that owns `info_center`
+/// and `command_center`.
+async fn handle_now_playing_command(
+  cmd: &MacMediaCommand,
+  info_center: &MPNowPlayingInfoCenter,
+  command_center: &MPRemoteCommandCenter,
+) {
   match cmd {
     MacMediaCommand::SetMetadata {
       title,
@@ -340,6 +466,28 @@ async fn handle_now_playing_command(cmd: &MacMediaCommand, info_center: &MPNowPl
     MacMediaCommand::SetVolume(_) => {
       // Volume is not directly supported by Now Playing center
     }
+    MacMediaCommand::SetShuffle(enabled) => unsafe {
+      // `Items` is the only shuffle spotatui has; `Collections` would claim we
+      // shuffle groups of tracks, which no source does.
+      let shuffle_type = if *enabled {
+        MPShuffleType::Items
+      } else {
+        MPShuffleType::Off
+      };
+      command_center
+        .changeShuffleModeCommand()
+        .setCurrentShuffleType(shuffle_type);
+    },
+    MacMediaCommand::SetRepeat(mode) => unsafe {
+      let repeat_type = match mode {
+        MacRepeatMode::Off => MPRepeatType::Off,
+        MacRepeatMode::One => MPRepeatType::One,
+        MacRepeatMode::All => MPRepeatType::All,
+      };
+      command_center
+        .changeRepeatModeCommand()
+        .setCurrentRepeatType(repeat_type);
+    },
     MacMediaCommand::SetStopped => unsafe {
       info_center.setPlaybackState(MPNowPlayingPlaybackState::Stopped);
       info_center.setNowPlayingInfo(None);
