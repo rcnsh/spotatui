@@ -124,8 +124,6 @@ impl App {
     self.dispatch(event);
   }
 
-  /// `Some(true)` when a decoded source owns the sink and plays, `Some(false)`
-  /// when it owns the sink and is paused, `None` when none owns it.
   /// Record a shuffle change an external media controller (MPRIS, macOS Now
   /// Playing) just made, so the UI reflects it before the next playback poll
   /// returns it. A no-op with no Spotify context, which is the right answer: a
@@ -158,6 +156,8 @@ impl App {
     }
   }
 
+  /// `Some(true)` when a decoded source owns the sink and plays, `Some(false)`
+  /// when it owns the sink and is paused, `None` when none owns it.
   pub(crate) fn decoded_playing_state(&self) -> Option<bool> {
     #[cfg(feature = "audio-decode")]
     {
