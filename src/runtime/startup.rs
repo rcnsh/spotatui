@@ -218,7 +218,13 @@ fn update_macos_metadata(
 }
 
 /// Map the player-global decoded repeat mode onto the Now Playing vocabulary.
-#[cfg(all(feature = "macos-media", target_os = "macos", feature = "audio-decode"))]
+///
+/// Gated on `local-files` rather than `audio-decode` because that is what the
+/// only call site is gated on: a macOS build with another decoded source but no
+/// local files (`--features macos-media,subsonic`) would otherwise compile this
+/// with no callers, and `-D warnings` turns that into a build failure. CI's
+/// macOS leg always carries `local-files`, so it cannot catch this one.
+#[cfg(all(feature = "macos-media", target_os = "macos", feature = "local-files"))]
 fn decoded_repeat_to_mac(mode: crate::infra::queue::RepeatMode) -> macos_media::MacRepeatMode {
   use crate::infra::queue::RepeatMode;
   match mode {
